@@ -1,0 +1,486 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+
+########################################################################################################################
+Parameters:
+########################################################################################################################
+  DataBucketName:
+    Type: String
+    Description: The name of the data bucket
+
+########################################################################################################################
+Resources:
+########################################################################################################################
+  ##############
+  # S3 buckets #
+  ##############
+  DataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Ref DataBucketName
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: "data-bucket/"
+  DataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Deny
+            Principal: "*"
+            Action: "*"
+            Resource:
+              - !Sub "arn:aws:s3:::${DataBucket}/*"
+              - !Sub "arn:aws:s3:::${DataBucket}"
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+  LoggingBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      AccessControl: LogDeliveryWrite
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: S3 Bucket access logging not needed for the logging bucket
+  LoggingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LoggingBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Deny
+            Principal: "*"
+            Action: "*"
+            Resource:
+              - !Sub "arn:aws:s3:::${LoggingBucket}/*"
+              - !Sub "arn:aws:s3:::${LoggingBucket}"
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  ############
+  # DynamoDB #
+  ############
+  CollectionsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: collection_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: collection_id
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      BillingMode: PAY_PER_REQUEST
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W74
+            reason: Server-side encryption using an AWS KMS key owned and managed by DynamoDB
+  FacesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: face_id
+          AttributeType: S
+        - AttributeName: filepath
+          AttributeType: S
+        - AttributeName: series
+          AttributeType: S
+      KeySchema:
+        - AttributeName: face_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: filepath_index
+          KeySchema:
+            - AttributeName: filepath
+              KeyType: HASH
+          Projection:
+            ProjectionType: KEYS_ONLY
+        - IndexName: series_index
+          KeySchema:
+            - AttributeName: series
+              KeyType: HASH
+          Projection:
+            ProjectionType: KEYS_ONLY
+        - IndexName: series_artists_index
+          KeySchema:
+            - AttributeName: series
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      BillingMode: PAY_PER_REQUEST
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W74
+            reason: Server-side encryption using an AWS KMS key owned and managed by DynamoDB
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: collection_id
+          AttributeType: S
+        - AttributeName: job_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: collection_id
+          KeyType: HASH
+        - AttributeName: job_id
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: job_id_index
+          KeySchema:
+            - AttributeName: job_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      BillingMode: PAY_PER_REQUEST
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W74
+            reason: Server-side encryption using an AWS KMS key owned and managed by DynamoDB
+  ResultsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: job_id
+          AttributeType: S
+        - AttributeName: video_timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: job_id
+          KeyType: HASH
+        - AttributeName: video_timestamp
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      BillingMode: PAY_PER_REQUEST
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W74
+            reason: Server-side encryption using an AWS KMS key owned and managed by DynamoDB
+
+  #############################
+  # S3 Events Lambda function #
+  #############################
+  S3EventsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: python3.9
+      Handler: lambda.handler
+      Timeout: 600
+      CodeUri: lambdas/s3_events/
+      Policies:
+      - S3ReadPolicy:
+          BucketName: !Ref DataBucketName
+      - DynamoDBCrudPolicy:
+          TableName: !Ref CollectionsTable
+      - DynamoDBCrudPolicy:
+          TableName: !Ref FacesTable
+      - RekognitionWriteOnlyAccessPolicy:
+          CollectionId: "*"
+      - RekognitionFacesManagementPolicy:
+          CollectionId: "*"
+      - StepFunctionsExecutionPolicy:
+          StateMachineName: !GetAtt FaceIdentificationWorkflowStateMachine.Name
+      - StepFunctionsExecutionPolicy:
+          StateMachineName: !GetAtt FaceIdentificationWorkflowRekognitionStateMachine.Name
+      Environment:
+        Variables:
+          COLLECTIONS_TABLE: !Ref CollectionsTable
+          FACES_TABLE: !Ref FacesTable
+          STATE_MACHINE_ARN: !Ref FaceIdentificationWorkflowStateMachine
+          LOG_LEVEL: INFO
+      Events:
+        S3ObjectCreatedEvent:
+          Type: S3
+          Properties:
+            Bucket: !Ref DataBucket
+            Events: s3:ObjectCreated:*
+        S3ObjectRemovedEvent:
+          Type: S3
+          Properties:
+            Bucket: !Ref DataBucket
+            Events: s3:ObjectRemoved:*
+
+  ###########################################
+  # Step Functions Lambda functions (steps) #
+  ###########################################
+
+  StartRekognitionShotDetectionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: python3.9
+      Handler: lambda.handler
+      Timeout: 600
+      CodeUri: lambdas/step_start_rekognition_shot_detection/
+      Environment:
+        Variables:
+          MIN_SEGMENT_CONFIDENCE: 99.0
+          LOG_LEVEL: INFO
+      Policies:
+        - Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Action:
+                - rekognition:StartSegmentDetection
+              Resource: "*"
+        - S3ReadPolicy:
+            BucketName: !Ref DataBucketName
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: Star resource required in the Rekognition policy
+
+  ExtractFramesRekognitionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: python3.9
+      Handler: lambda.handler
+      Timeout: 900
+      EphemeralStorage:
+        Size: 5120
+      MemorySize: 5120
+      CodeUri: lambdas/step_extract_frames_rekognition/
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+      Policies:
+        - Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Action:
+                - rekognition:GetSegmentDetection
+              Resource: "*"
+        - S3CrudPolicy:
+            BucketName: !Ref DataBucketName
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: Star resource required in the Rekognition policy
+
+  RecordJobIdFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: python3.9
+      Handler: lambda.handler
+      Timeout: 600
+      CodeUri: lambdas/step_record_job/
+      Environment:
+        Variables:
+          JOBS_TABLE: !Ref JobsTable
+          LOG_LEVEL: INFO
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref JobsTable
+
+  ProcessFrameFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: python3.9
+      Handler: lambda.handler
+      Timeout: 600
+      CodeUri: lambdas/step_process_frame/
+      Environment:
+        Variables:
+          LABEL_MINIMUM_CONFIDENCE_LEVEL: 70
+          FACE_MINIMUM_CONFIDENCE_LEVEL: 85
+          RESULTS_TABLE: !Ref ResultsTable
+          LOG_LEVEL: INFO
+      Policies:
+        - Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Action:
+                - rekognition:DetectLabels
+                - rekognition:DetectFaces
+                - rekognition:SearchFacesByImage
+              Resource: "*"
+        - DynamoDBWritePolicy:
+            TableName: !Ref ResultsTable
+        - S3ReadPolicy:
+            BucketName: !Ref DataBucketName
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: Star resource required in the Rekognition policy
+
+  #################################
+  # Step Functions state machines #
+  #################################
+  ArtistTrackingStepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: !Sub "states.${AWS::Region}.amazonaws.com"
+          Action: "sts:AssumeRole"
+      Path: /
+      Policies:
+      - PolicyName: s3Actions
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: Allow
+            Action:
+            - "s3:GetObject"
+            - "s3:ListBucket"
+            - "s3:ListBucketMultipartUploads"
+            - "s3:ListMultipartUploadParts"
+            - "s3:AbortMultipartUpload"
+            - "s3:GetBucketLocation"
+            - "s3:GetObjectVersion"
+            - "s3:GetLifecycleConfiguration"
+            - "s3:PutObject"
+            - "s3:PutObjectAcl"
+            - "s3:PutLifecycleConfiguration"
+            Resource:
+            - !Sub "arn:${AWS::Partition}:s3:::${DataBucketName}"
+            - !Sub "arn:${AWS::Partition}:s3:::${DataBucketName}/*"
+      - PolicyName: lambdaInvoke
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Effect: Allow
+            Action: "lambda:InvokeFunction"
+            Resource:
+              - !GetAtt RecordJobIdFunction.Arn
+              - !GetAtt ProcessFrameFunction.Arn
+              - !GetAtt StartRekognitionShotDetectionFunction.Arn
+              - !GetAtt ExtractFramesRekognitionFunction.Arn
+
+  FaceIdentificationWorkflowRekognitionStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      DefinitionString: !Sub |
+        {
+            "StartAt": "Start Shot Detection",
+            "States": {
+                "Start Shot Detection": {
+                    "Comment": "Starts Rekognition Shot Detection.",
+                    "Type": "Task",
+                    "Resource": "${StartRekognitionShotDetectionFunction.Arn}",
+                    "Parameters": {
+                      "video.$": "$.video",
+                      "bucket.$": "$.bucket",
+                      "collection.$": "$.collection",
+                      "job_id.$": "$$.Execution.Id"
+                    },
+                    "Next": "Extract Frames Rekognition"
+                },
+                "Extract Frames Rekognition": {
+                    "Comment": "Extracts frames from video using OpenCV and Rekognition results.",
+                    "Type": "Task",
+                    "Resource": "${ExtractFramesRekognitionFunction.Arn}",
+                    "Parameters": {
+                      "rekognition_job_id.$": "$.rekognition_job_id",
+                      "video.$": "$.video",
+                      "bucket.$": "$.bucket",
+                      "collection.$": "$.collection",
+                      "job_id.$": "$$.Execution.Id"
+                    },
+                    "Retry": [
+                      {
+                        "ErrorEquals": [
+                          "ResourcePending"
+                        ],
+                        "IntervalSeconds": 60,
+                        "BackoffRate": 1,
+                        "MaxAttempts": 500
+                      }
+                    ],
+                    "Next": "Record Job Id"
+                },
+                "Record Job Id": {
+                    "Comment": "Record this job for querying.",
+                    "Type": "Task",
+                    "Resource": "${RecordJobIdFunction.Arn}",
+                    "Next": "Process KeyFrames"
+                },
+                "Process KeyFrames": {
+                    "Comment": "Processes each frame extracted from video in order to identify persons and/or faces.",
+                    "Type": "Map",
+                    "End": true,
+                    "MaxConcurrency": 20,
+                    "ItemsPath": "$.frames",
+                    "Parameters": {
+                        "video.$": "$.video",
+                        "bucket.$": "$.bucket",
+                        "collection.$": "$.collection",
+                        "frame.$": "$$.Map.Item.Value",
+                        "job_id.$": "$.job_id"
+                    },
+                    "Iterator": {
+                        "StartAt": "Process Frame",
+                        "States": {
+                            "Process Frame": {
+                                "Comment": "Calls Amazon Rekognition to identify persons and faces on a single frame.",
+                                "Type": "Task",
+                                "Resource": "${ProcessFrameFunction.Arn}",
+                                "Retry": [
+                                    {
+                                        "ErrorEquals": [
+                                            "Rekognition.LimitExceededException",
+                                            "Rekognition.ProvisionedThroughputExceededException"
+                                        ],
+                                        "IntervalSeconds": 60,
+                                        "BackoffRate": 1,
+                                        "MaxAttempts": 1000
+                                    }
+                                ],
+                                "End": true
+                            }
+                        }
+                    }
+                }
+            }
+        }
+      RoleArn: !GetAtt ArtistTrackingStepFunctionsRole.Arn

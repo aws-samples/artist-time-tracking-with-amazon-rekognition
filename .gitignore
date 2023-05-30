@@ -1,0 +1,6 @@
+.DS_Store
+.aws-sam
+samconfig.toml
+events/*
+env/*
+.idea
